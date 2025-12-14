@@ -1,46 +1,49 @@
-from fastapi import FastAPI, HTTPException
-from pydantic import BaseModel
+from fastapi import FastAPI, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import JSONResponse
+from pydantic import BaseModel
 from rag_core import NasdaqRagBot
 
 app = FastAPI()
 
+# 1. CORS 설정 (기본)
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],  # 여기를 ["*"] 로 설정하면 어디서든 접속 가능
+    allow_origins=["*"],
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
 )
 
-# CORS 설정 (React 포트 5173 허용)
-origins = [
-    "http://localhost:5173",
-    "http://127.0.0.1:5173",
-]
-
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=origins,
-    allow_credentials=True,
-    allow_methods=["*"],
-    allow_headers=["*"],
-)
-
-# 봇 인스턴스 (서버 시작 시 1회 로딩)
-bot = NasdaqRagBot()
+# 2. ★ [특단의 조치] OPTIONS 요청 강제 처리 (에러 방지용) ★
+@app.options("/{rest_of_path:path}")
+async def preflight_handler(rest_of_path: str):
+    return JSONResponse(
+        content="OK",
+        headers={
+            "Access-Control-Allow-Origin": "*",
+            "Access-Control-Allow-Methods": "*",
+            "Access-Control-Allow-Headers": "*",
+        },
+    )
 
 class QueryRequest(BaseModel):
     query: str
 
+# 봇 초기화
+try:
+    bot = NasdaqRagBot()
+    print("✅ Bot Loaded")
+except Exception as e:
+    print(f"❌ Bot Fail: {e}")
+    bot = None
+
 @app.post("/chat")
-async def chat(request: QueryRequest):
-    try:
-        answer = bot.get_answer(request.query)
-        return {"answer": answer}
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
+def chat(request: QueryRequest):
+    if not bot:
+        raise HTTPException(status_code=500, detail="Bot not initialized")
+    return {"answer": bot.get_answer(request.query)}
 
 @app.get("/")
 def read_root():
-    return {"status": "Nasdaq RAG Server is running"}
+    return {"status": "alive"}
