@@ -7,12 +7,11 @@ from datetime import datetime, timedelta
 from dotenv import load_dotenv
 
 from langchain_openai import ChatOpenAI, OpenAIEmbeddings
-# ★★★ [여기가 수정되었습니다] ★★★
-from langchain_community.vectorstores import Chroma 
+from langchain_community.vectorstores import Chroma
 from langchain_core.tools import tool
 from langchain_core.messages import SystemMessage
 
-# 0.1.20 버전 호환 임포트
+# 호환성 유지 임포트
 from langchain.agents import create_openai_functions_agent, AgentExecutor
 from langchain import hub
 from langchain.tools.retriever import create_retriever_tool
@@ -40,86 +39,136 @@ class NasdaqRagBot:
         
         self.vectorstore = None
         self.retriever = None
-        self.setup_rag_system()
         
+        # RAG 시스템 초기화 (안전 모드)
+        try:
+            self.setup_rag_system()
+        except Exception as e:
+            print(f"⚠️ [Warning] RAG 시스템 초기화 실패 (봇은 계속 실행됩니다): {e}")
+            self.retriever = None
+        
+        # 에이전트 구축
         self.agent_executor = self.setup_agent()
 
     def setup_rag_system(self):
-        """나스닥 데이터 관리 및 RAG 초기화"""
+        """나스닥 데이터 관리 및 RAG 초기화 (1분 쿨타임 적용)"""
         print("[System] 나스닥 데이터 캐싱 확인 중...")
         os.makedirs("data", exist_ok=True)
         csv_path = "data/nasdaq_history.csv"
         db_path = "./chroma_db"
         
         today_str = datetime.now().strftime("%Y-%m-%d")
-        is_cache_valid = False
-        
-        if os.path.exists(csv_path) and os.path.exists(db_path):
-            file_timestamp = os.path.getmtime(csv_path)
-            file_date = datetime.fromtimestamp(file_timestamp).strftime("%Y-%m-%d")
-            if file_date == today_str:
-                is_cache_valid = True
+        should_download = True
 
-        if is_cache_valid:
-            print(f"✅ [Smart Skip] 오늘의 나스닥 데이터가 이미 존재합니다.")
-            self.vectorstore = Chroma(
-                persist_directory=db_path,
-                embedding_function=self.embedding_model,
-                collection_name="nasdaq_history_v2"
-            )
-            self.retriever = self.vectorstore.as_retriever(search_kwargs={"k": 3})
-            return
-
-        print(f"🔄 [Update] 나스닥 최신 데이터를 다운로드합니다...")
-        if os.path.exists(db_path): shutil.rmtree(db_path)
-
-        try:
-            df = yf.download("^IXIC", start="2010-01-01", end=today_str, progress=False)
-            if isinstance(df.columns, pd.MultiIndex):
-                df.columns = df.columns.get_level_values(1)
-            df = df.reset_index()
-            df.to_csv(csv_path, index=False)
-        except Exception as e:
-            print(f"[Warning] 다운로드 실패: {e}")
-            return
-
+        # ★★★ [핵심 로직] Rate Limiting (1분 쿨타임) ★★★
         if os.path.exists(csv_path):
-            df = pd.read_csv(csv_path, parse_dates=["Date"])
-            df.set_index("Date", inplace=True)
-            if len(df.columns) >= 4:
-                df.columns = ["Open", "High", "Low", "Close", "Volume"][:len(df.columns)]
+            # 1. 파일의 마지막 수정 시간 확인
+            file_timestamp = os.path.getmtime(csv_path)
+            last_modified_date = datetime.fromtimestamp(file_timestamp)
+            time_diff = datetime.now() - last_modified_date
             
+            # 2. 오늘 날짜인지 확인
+            is_today = last_modified_date.strftime("%Y-%m-%d") == today_str
+            
+            # [판단] 1분 이내에 생성됐거나, 이미 오늘 데이터를 가지고 있다면 스킵
+            if time_diff < timedelta(minutes=1):
+                print(f"⏳ [Rate Limit] 방금({time_diff.seconds}초 전) 다운로드했습니다. 요청을 건너뜁니다.")
+                should_download = False
+            elif is_today and os.path.exists(db_path):
+                print(f"✅ [Smart Skip] 오늘의 데이터가 이미 존재합니다.")
+                should_download = False
+
+        if should_download:
             try:
-                monthly = df["Close"].resample("ME").agg(["first", "last"])
-            except:
-                monthly = df["Close"].resample("M").agg(["first", "last"])
-            monthly["return"] = (monthly["last"] / monthly["first"] - 1) * 100
-            
-            docs_text = []
-            docs_meta = []
-            for date, row in monthly.iterrows():
-                if pd.isna(row['first']): continue
-                text = (f"{date.year}년 {date.month}월 나스닥 시장: "
-                        f"{'상승' if row['return'] > 0 else '하락'} 마감 ({row['return']:.2f}%).")
-                docs_text.append(text)
-                docs_meta.append({"year": date.year, "month": date.month})
-            
-            self.vectorstore = Chroma.from_texts(
-                texts=docs_text,
-                metadatas=docs_meta,
-                embedding=self.embedding_model,
-                collection_name="nasdaq_history_v2",
-                persist_directory=db_path
-            )
-            self.retriever = self.vectorstore.as_retriever(search_kwargs={"k": 3})
+                print(f"🔄 [Update] 나스닥 최신 데이터를 다운로드 시도...")
+                # yfinance 다운로드
+                df = yf.download("^IXIC", start="2010-01-01", end=today_str, progress=False)
+                
+                if df.empty:
+                    print("⚠️ [Warning] 다운로드된 데이터가 없습니다. 기존 파일을 사용합니다.")
+                else:
+                    # MultiIndex 컬럼 처리
+                    if isinstance(df.columns, pd.MultiIndex):
+                        df.columns = df.columns.get_level_values(0)
+
+                    df = df.reset_index()
+                    df.to_csv(csv_path, index=False)
+                    print("✅ 데이터 다운로드 및 저장 성공")
+                    
+            except Exception as e:
+                print(f"⚠️ [Pass] 데이터 다운로드 실패 (야후 차단 가능성): {e}")
+                # 실패하면 그냥 넘어갑니다 (기존 파일이 있으면 그것을 쓰게 됨)
+
+        # 2. 데이터 로드 및 벡터 저장소 구축
+        if os.path.exists(csv_path):
+            try:
+                # 파일이 있으면 읽어서 DB 구축 (없으면 RAG 기능만 꺼짐)
+                df = pd.read_csv(csv_path)
+                
+                # 날짜 컬럼 처리
+                if 'Date' in df.columns:
+                    df['Date'] = pd.to_datetime(df['Date'])
+                    df.set_index('Date', inplace=True)
+                
+                # 컬럼 이름 보정 (Close가 없는 경우 대비)
+                if 'Close' not in df.columns and 'Adj Close' in df.columns:
+                     df.rename(columns={'Adj Close': 'Close'}, inplace=True)
+                
+                # 월봉 리샘플링
+                try:
+                    monthly = df["Close"].resample("ME").agg(["first", "last"])
+                except:
+                    monthly = df["Close"].resample("M").agg(["first", "last"])
+                    
+                monthly["return"] = (monthly["last"] / monthly["first"] - 1) * 100
+                
+                docs_text = []
+                docs_meta = []
+                for date, row in monthly.iterrows():
+                    if pd.isna(row['first']): continue
+                    text = (f"{date.year}년 {date.month}월 나스닥 시장: "
+                            f"{'상승' if row['return'] > 0 else '하락'} 마감 ({row['return']:.2f}%).")
+                    docs_text.append(text)
+                    docs_meta.append({"year": date.year, "month": date.month})
+                
+                # DB가 없거나 새로 다운로드받았을 때만 DB 재생성
+                if should_download or not os.path.exists(db_path):
+                    if os.path.exists(db_path): shutil.rmtree(db_path)
+                    self.vectorstore = Chroma.from_texts(
+                        texts=docs_text,
+                        metadatas=docs_meta,
+                        embedding=self.embedding_model,
+                        collection_name="nasdaq_history_v2",
+                        persist_directory=db_path
+                    )
+                else:
+                    # 기존 DB 연결
+                    self.vectorstore = Chroma(
+                        persist_directory=db_path,
+                        embedding_function=self.embedding_model,
+                        collection_name="nasdaq_history_v2"
+                    )
+
+                self.retriever = self.vectorstore.as_retriever(search_kwargs={"k": 3})
+                print("✅ RAG 시스템 준비 완료")
+                
+            except Exception as e:
+                print(f"❌ [Error] 데이터 처리 중 오류 발생: {e}")
+                self.retriever = None
+        else:
+            print("❌ [Error] 사용할 수 있는 나스닥 데이터 파일이 없습니다.")
 
     def setup_agent(self):
+        tools = []
+        
         # 1. RAG 도구
-        retriever_tool = create_retriever_tool(
-            self.retriever,
-            "nasdaq_history_search",
-            "나스닥의 과거 흐름이나 역사적 데이터를 검색할 때 사용."
-        )
+        if self.retriever:
+            retriever_tool = create_retriever_tool(
+                self.retriever,
+                "nasdaq_history_search",
+                "나스닥의 과거 흐름이나 역사적 데이터를 검색할 때 사용."
+            )
+            tools.append(retriever_tool)
         
         # 2. 단순 조회 도구
         @tool
@@ -131,6 +180,7 @@ class NasdaqRagBot:
                 return str({"price": info.get("currentPrice"), "pe": info.get("trailingPE")})
             except:
                 return "조회 실패"
+        tools.append(get_stock_price)
 
         # 3. 기술적 분석 도구
         @tool
@@ -181,14 +231,15 @@ class NasdaqRagBot:
 
             except Exception as e:
                 return f"에러: {e}"
+        tools.append(analyze_technical_indicators)
 
-        tools = [retriever_tool, get_stock_price, analyze_technical_indicators]
-        
         system_msg = """
         당신은 냉철한 '주식 투자 보조 에이전트'입니다.
         사용자가 특정 종목의 매수/매도 여부를 물으면 반드시 아래 포맷을 엄격하게 지켜서 답변하세요.
 
-        [답변 포맷]
+        [필수 포맷 가이드]
+        각 섹션 사이에는 반드시 '빈 줄(줄바꿈 2번)'을 넣어서 가독성을 높이세요.
+
         # 1. 결론: [매수 추천 / 매도 추천 / 관망] 중 택 1
         
         # 2. 투자 근거 (5가지)
